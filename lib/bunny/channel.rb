@@ -145,6 +145,10 @@ module Bunny
     # This will be set to the current sequence index during automatic network failure recovery
     # to keep the sequence monotonic for the user and abstract the reset from the protocol
     attr_reader :delivery_tag_offset
+    # @return [Integer] Max seen consumer acknowledgement sequence index.
+    attr_reader :max_seen_delivery_tag
+    # @return [Integer] Offset for the consumer acknowledgement sequence index.
+    attr_reader :active_delivery_tag_offset
     # @return [Hash<String, Bunny::Queue>] Queue instances declared on this channel
     attr_reader :queues
     # @return [Hash<String, Bunny::Exchange>] Exchange instances declared on this channel
@@ -204,6 +208,8 @@ module Bunny
 
       @unconfirmed_set_mutex = @connection.mutex_impl.new
 
+      @stale_delivery_tags_mutex = @connection.mutex_impl.new
+
       self.reset_continuations
 
       # threads awaiting on continuations. Used to unblock
@@ -215,6 +221,9 @@ module Bunny
 
       @next_publish_seq_no = 0
       @delivery_tag_offset = 0
+
+      @max_seen_delivery_tag = 0
+      @active_delivery_tag_offset = 0
 
       @uncaught_exception_handler = Proc.new do |e, consumer|
         @logger.error "Uncaught exception from consumer #{consumer.to_s}: #{e.inspect} @ #{e.backtrace[0]}"
@@ -235,6 +244,14 @@ module Bunny
       @threads_waiting_on_continuations           = Set.new
       @threads_waiting_on_confirms_continuations  = Set.new
       @threads_waiting_on_basic_get_continuations = Set.new
+
+      # Update consumer acknowledgement delivery tag offsets to ensure that we
+      # do not send consumer acknowledgements with stale delivery tags in case
+      # of connection recovery.
+      @stale_delivery_tags_mutex.synchronize do
+        @active_delivery_tag_offset += @max_seen_delivery_tag
+        @max_seen_delivery_tag = 0
+      end
 
       @connection.open_channel(self)
       # clear last channel error
@@ -829,10 +846,18 @@ module Bunny
     # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
     # @api public
     def basic_reject(delivery_tag, requeue = false)
-      raise_if_no_longer_open!
-      @connection.send_frame(AMQ::Protocol::Basic::Reject.encode(@id, delivery_tag, requeue))
+      @stale_delivery_tags_mutex.synchronize do
+        raise_if_no_longer_open!
 
-      nil
+        # Note that the basic_ack comment above does not apply here since
+        # basic.reject doesn't support rejecting multiple deliveries at once.
+        real_tag = delivery_tag - @active_delivery_tag_offset
+        return if real_tag <= 0
+
+        @connection.send_frame(AMQ::Protocol::Basic::Reject.encode(@id, real_tag, requeue))
+
+        nil
+      end
     end
 
     # Acknowledges a delivery (message).
@@ -875,9 +900,20 @@ module Bunny
     # @see http://rubybunny.info/articles/queues.html Queues and Consumers guide
     # @api public
     def basic_ack(delivery_tag, multiple = false)
-      guarding_against_stale_delivery_tags(delivery_tag) do
+      @stale_delivery_tags_mutex.synchronize do
         raise_if_no_longer_open!
-        @connection.send_frame(AMQ::Protocol::Basic::Ack.encode(@id, delivery_tag, multiple))
+
+        # Last delivery is likely the same one a long running consumer is still
+        # processing, so real_tag might end up being 0 that has a special
+        # meaning in the protocol (i.e. acknowledge all unacknowledged tags), so
+        # if the user explicitly asks for that with multiple = true, do it.
+        all_tags = multiple && delivery_tag == 0
+        real_tag = all_tags ? 0 : (delivery_tag - @active_delivery_tag_offset)
+        # Delivery tags start at 1, so the real tag is stale therefore we should
+        # do nothing.
+        return if !all_tags && real_tag <= 0
+
+        @connection.send_frame(AMQ::Protocol::Basic::Ack.encode(@id, real_tag, multiple))
 
         nil
       end
@@ -937,10 +973,16 @@ module Bunny
     # @see http://rubybunny.info/articles/extensions.html RabbitMQ Extensions guide
     # @api public
     def basic_nack(delivery_tag, multiple = false, requeue = false)
-      guarding_against_stale_delivery_tags(delivery_tag) do
+      @stale_delivery_tags_mutex.synchronize do
         raise_if_no_longer_open!
+
+        # See comments in basic_ack above.
+        all_tags = multiple && delivery_tag == 0
+        real_tag = all_tags ? 0 : (delivery_tag - @active_delivery_tag_offset)
+        return if !all_tags && real_tag <= 0
+
         @connection.send_frame(AMQ::Protocol::Basic::Nack.encode(@id,
-                                                                 delivery_tag,
+                                                                 real_tag,
                                                                  multiple,
                                                                  requeue))
 
@@ -2025,6 +2067,13 @@ module Bunny
     def handle_frameset(basic_deliver, properties, content)
       consumer = @consumers[basic_deliver.consumer_tag]
       if consumer
+        delivery_tag = basic_deliver.delivery_tag
+        @stale_delivery_tags_mutex.synchronize do
+          if delivery_tag > @max_seen_delivery_tag
+            @max_seen_delivery_tag = delivery_tag
+          end
+          basic_deliver = offset_delivery_tag(basic_deliver)
+        end
         @work_pool.submit do
           begin
             consumer.call(DeliveryInfo.new(basic_deliver, consumer, self), MessageProperties.new(properties), content)
@@ -2035,6 +2084,15 @@ module Bunny
       else
         @logger.warn "No consumer for tag #{basic_deliver.consumer_tag} on channel #{@id}!"
       end
+    end
+
+    # @private
+    def offset_delivery_tag(basic_deliver)
+      AMQ::Protocol::Basic::Deliver.new(basic_deliver.consumer_tag,
+                                        basic_deliver.delivery_tag + @active_delivery_tag_offset,
+                                        basic_deliver.redelivered,
+                                        basic_deliver.exchange,
+                                        basic_deliver.routing_key)
     end
 
     # @private
@@ -2418,13 +2476,6 @@ module Bunny
     # @private
     def new_continuation
       Concurrent::ContinuationQueue.new
-    end
-
-    # @private
-    def guarding_against_stale_delivery_tags(tag, &block)
-      case tag
-      when Integer then block.call
-      end
     end
   end # Channel
 end # Bunny
