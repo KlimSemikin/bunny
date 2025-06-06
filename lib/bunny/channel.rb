@@ -854,7 +854,7 @@ module Bunny
         real_tag = delivery_tag - @active_delivery_tag_offset
         return if real_tag <= 0
 
-        @connection.send_frame(AMQ::Protocol::Basic::Reject.encode(@id, real_tag, requeue))
+        @connection.send_frame(AMQ::Protocol::Basic::Reject.encode(@id, real_tag, requeue), true, true)
 
         nil
       end
@@ -913,7 +913,7 @@ module Bunny
         # do nothing.
         return if !all_tags && real_tag <= 0
 
-        @connection.send_frame(AMQ::Protocol::Basic::Ack.encode(@id, real_tag, multiple))
+        @connection.send_frame(AMQ::Protocol::Basic::Ack.encode(@id, real_tag, multiple), true, true)
 
         nil
       end
@@ -984,7 +984,7 @@ module Bunny
         @connection.send_frame(AMQ::Protocol::Basic::Nack.encode(@id,
                                                                  real_tag,
                                                                  multiple,
-                                                                 requeue))
+                                                                 requeue), true, true)
 
         nil
       end

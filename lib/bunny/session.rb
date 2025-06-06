@@ -1359,12 +1359,12 @@ module Bunny
     #
     # @raise [ConnectionClosedError]
     # @private
-    def send_frame(frame, signal_activity = true)
+    def send_frame(frame, signal_activity = true, raise_exceptions = false)
       if open?
         # @transport_mutex.synchronize do
         #   @transport.write(frame.encode)
         # end
-        @transport.write(frame.encode)
+        @transport.write(frame.encode, raise_exceptions)
         signal_activity! if signal_activity
       else
         raise ConnectionClosedError.new(frame)

@@ -155,8 +155,8 @@ module Bunny
 
     # Writes data to the socket. If read/write timeout was specified the operation will return after that
     # amount of time has elapsed waiting for the socket.
-    def write(data)
-      return write_without_timeout(data) unless @write_timeout
+    def write(data, raise_exceptions = false)
+      return write_without_timeout(data, raise_exceptions) unless @write_timeout
 
       begin
         if open?
@@ -168,6 +168,8 @@ module Bunny
         @logger.error "Got an exception when sending data: #{e.message} (#{e.class.name})"
         close
         @status = :not_connected
+
+        raise e if raise_exceptions
 
         if @session.automatically_recover?
           @session.handle_network_failure(e)
